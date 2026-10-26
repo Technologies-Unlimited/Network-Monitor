@@ -61,3 +61,6 @@ yarn-debug.log*
 yarn-error.log*
 bun.lock
 package-lock.json
+
+# Claude Code hook runtime state (session logs, stop intents); ThothOS ignores it too
+.runner/
