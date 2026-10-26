@@ -163,9 +163,13 @@ type LoginResponse struct {
 	UserType                string `json:"userType,omitempty"`
 	CompanyID               string `json:"companyId,omitempty"`
 	AdministrationCompanyID string `json:"administrationCompanyId,omitempty"`
-	NextStep                string `json:"nextStep,omitempty"`
-	Message                 string `json:"message,omitempty"`
-	Error                   string `json:"error,omitempty"`
+	// MfaChallengeToken is the short-lived step-2 challenge ThothOS mints at
+	// step 1 (ThothOS #2701). Step 2 must present it or ThothOS refuses 401
+	// before checking any code. Absent when talking to a pre-#2701 ThothOS.
+	MfaChallengeToken string `json:"mfaChallengeToken,omitempty"`
+	NextStep          string `json:"nextStep,omitempty"`
+	Message           string `json:"message,omitempty"`
+	Error             string `json:"error,omitempty"`
 }
 
 // VerifyMFARequest represents the MFA verification request
@@ -176,6 +180,9 @@ type VerifyMFARequest struct {
 	Code                    string `json:"code" binding:"required,len=6"`
 	CompanyID               string `json:"companyId"`
 	AdministrationCompanyID string `json:"administrationCompanyId"`
+	// MfaChallengeToken is the value step 1 returned; forwarded verbatim to
+	// ThothOS in the step-2 body.
+	MfaChallengeToken string `json:"mfaChallengeToken,omitempty"`
 }
 
 // VerifyMFAResponse represents the response from MFA verification
@@ -189,6 +196,42 @@ type VerifyMFAResponse struct {
 	UserName  string `json:"userName,omitempty"`
 	Message   string `json:"message,omitempty"`
 	Error     string `json:"error,omitempty"`
+	// Code is ThothOS's machine reason for a step-2 failure (#2701):
+	// mfa_challenge_required, mfa_code_invalid, mfa_locked, mfa_rate_limited.
+	// Empty from a ThothOS that predates it.
+	Code string `json:"code,omitempty"`
+	// RetryAfterSeconds is ThothOS's own field name (verify-mfa route.ts:432),
+	// also filled from the Retry-After header when only the header was sent.
+	RetryAfterSeconds int `json:"retryAfterSeconds,omitempty"`
+	// RestartLogin tells the UI the step-1 challenge is missing or expired:
+	// start over from step 1. No code was evaluated, so it is not a wrong code.
+	RestartLogin bool `json:"restartLogin,omitempty"`
+	// Locked marks ThothOS's final 423: the authenticator's guess budget is
+	// spent and neither waiting nor retrying lifts it.
+	Locked bool `json:"locked,omitempty"`
+}
+
+// thothosInvalidCodeMessage is the exact error ThothOS answers a WRONG code
+// with (verify-mfa route.ts:745, status 401). Every other 401 from step 2 is
+// the challenge refusal (route.ts:392): the token was missing or expired and
+// no code was evaluated. ThothOS gives the two no distinguishing field, so the
+// message is the only discriminator.
+const thothosInvalidCodeMessage = "Invalid MFA code"
+
+// maxRetryAfterSeconds bounds a Retry-After we are willing to relay.
+const maxRetryAfterSeconds = 24 * 60 * 60
+
+// parseRetryAfterSeconds reads a delta-seconds Retry-After header value
+// (the only form ThothOS sends). Zero means absent or unusable.
+func parseRetryAfterSeconds(v string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	if n > maxRetryAfterSeconds {
+		return maxRetryAfterSeconds
+	}
+	return n
 }
 
 // RegisterAuthRoutes registers authentication routes
@@ -280,6 +323,10 @@ func (s *AuthService) handleLogin(c *gin.Context) {
 	}
 
 	if !thothosResp.Success {
+		// Relay the step-1 rate limit's wait (login route.ts:73).
+		if v := resp.Header.Get("Retry-After"); parseRetryAfterSeconds(v) > 0 {
+			c.Header("Retry-After", v)
+		}
 		c.JSON(resp.StatusCode, thothosResp)
 		return
 	}
@@ -336,6 +383,9 @@ func (s *AuthService) handleVerifyMFA(c *gin.Context) {
 		"companyId":               req.CompanyID,
 		"administrationCompanyId": req.AdministrationCompanyID,
 	}
+	if req.MfaChallengeToken != "" {
+		payload["mfaChallengeToken"] = req.MfaChallengeToken
+	}
 	payloadBytes, _ := json.Marshal(payload)
 
 	client := thothosHTTPClient(30*time.Second, originOf(req.ThothOSURL))
@@ -378,10 +428,7 @@ func (s *AuthService) handleVerifyMFA(c *gin.Context) {
 	}
 
 	if !thothosResp.Success {
-		// Treat any non-success response from ThothOS as a verification
-		// failure for rate-limiting purposes.
-		s.mfaLimits.recordFailure(limitKey)
-		c.JSON(resp.StatusCode, thothosResp)
+		s.relayVerifyMFAFailure(c, limitKey, resp, &thothosResp)
 		return
 	}
 	s.mfaLimits.recordSuccess(limitKey)
@@ -458,6 +505,103 @@ func (s *AuthService) handleVerifyMFA(c *gin.Context) {
 		UserName:  thothosResp.UserName,
 		Message:   "Authentication successful. Proxy is now connected to ThothOS.",
 	})
+}
+
+// relayVerifyMFAFailure answers the browser for a non-success ThothOS step-2
+// response, classifying it so the UI can act:
+//
+//   - 401 other than "Invalid MFA code": the step-1 challenge is missing or
+//     expired and no code was evaluated -> restartLogin, NOT a wrong code;
+//   - 423: the authenticator is locked for good -> locked, NOT a wrong code
+//     (no code was evaluated);
+//   - 429: ThothOS's ladder refused the guess (no code evaluated) -> relay
+//     Retry-After / retryAfterSeconds;
+//   - anything else (including a wrong code) counts toward the local limiter.
+func (s *AuthService) relayVerifyMFAFailure(c *gin.Context, limitKey string, resp *http.Response, out *VerifyMFAResponse) {
+	status := resp.StatusCode
+
+	if wait := parseRetryAfterSeconds(resp.Header.Get("Retry-After")); wait > 0 {
+		c.Header("Retry-After", strconv.Itoa(wait))
+		if out.RetryAfterSeconds <= 0 {
+			out.RetryAfterSeconds = wait
+		}
+	}
+
+	switch classifyVerifyMFAFailure(status, out) {
+	case mfaOutcomeRestart:
+		out.RestartLogin = true
+	case mfaOutcomeLocked:
+		out.Locked = true
+	case mfaOutcomeWait:
+		// Refused before any code was checked; nothing to count.
+	default:
+		// Treat any other non-success response from ThothOS as a
+		// verification failure for rate-limiting purposes.
+		s.mfaLimits.recordFailure(limitKey)
+	}
+
+	c.JSON(status, out)
+}
+
+// ThothOS's machine codes on step-2 failures (ThothOS #2701).
+const (
+	mfaCodeChallengeRequired = "mfa_challenge_required"
+	mfaCodeInvalid           = "mfa_code_invalid"
+	mfaCodeLocked            = "mfa_locked"
+	mfaCodeRateLimited       = "mfa_rate_limited"
+)
+
+type mfaOutcome int
+
+const (
+	// mfaOutcomeCount: a code may have been evaluated; charge the local limiter.
+	mfaOutcomeCount mfaOutcome = iota
+	// mfaOutcomeRestart: challenge missing/expired; no code evaluated.
+	mfaOutcomeRestart
+	// mfaOutcomeLocked: final lock; no code evaluated.
+	mfaOutcomeLocked
+	// mfaOutcomeWait: ladder refusal; no code evaluated.
+	mfaOutcomeWait
+)
+
+// classifyVerifyMFAFailure decides what a non-success step-2 response means.
+// The machine `code` decides when present. Only when it is empty (a ThothOS
+// that predates #2701) do the status and the message decide.
+//
+// It fails closed: restarting skips the local limiter, so ONLY an explicit
+// mfa_challenge_required (or, with no code, the legacy challenge message) may
+// restart. An unknown non-empty code on a 401 counts as a failure.
+func classifyVerifyMFAFailure(status int, out *VerifyMFAResponse) mfaOutcome {
+	switch out.Code {
+	case mfaCodeChallengeRequired:
+		return mfaOutcomeRestart
+	case mfaCodeInvalid:
+		return mfaOutcomeCount
+	case mfaCodeLocked:
+		return mfaOutcomeLocked
+	case mfaCodeRateLimited:
+		return mfaOutcomeWait
+	case "":
+		// Legacy fallback: status and message.
+		switch {
+		case status == http.StatusUnauthorized && out.Error != thothosInvalidCodeMessage:
+			return mfaOutcomeRestart
+		case status == http.StatusLocked:
+			return mfaOutcomeLocked
+		case status == http.StatusTooManyRequests:
+			return mfaOutcomeWait
+		}
+		return mfaOutcomeCount
+	}
+	// Unknown non-empty code: a 401 must count (never a free retry); the
+	// status alone still identifies the two refusals that evaluated no code.
+	switch status {
+	case http.StatusLocked:
+		return mfaOutcomeLocked
+	case http.StatusTooManyRequests:
+		return mfaOutcomeWait
+	}
+	return mfaOutcomeCount
 }
 
 // handleAuthStatus returns the current authentication status
