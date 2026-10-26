@@ -257,8 +257,11 @@
             userId: '',
             userType: '',
             companyId: '',
-            administrationCompanyId: ''
+            administrationCompanyId: '',
+            // Short-lived step-2 challenge minted by ThothOS at step 1.
+            mfaChallengeToken: ''
         };
+        let waitTimer = null;
 
         // DOM elements
         const step1 = document.getElementById('step-1');
@@ -298,6 +301,55 @@
             document.getElementById('mfa-code').focus();
         }
 
+        // Back to step 1 (challenge missing or expired). The old token and the
+        // typed code are discarded; the form fields keep their values.
+        function goToStep1() {
+            loginState.userId = '';
+            loginState.userType = '';
+            loginState.companyId = '';
+            loginState.administrationCompanyId = '';
+            loginState.mfaChallengeToken = '';
+            document.getElementById('mfa-code').value = '';
+            step2.classList.remove('active');
+            step1.classList.add('active');
+            stepIndicator2.classList.remove('active');
+            stepIndicator1.classList.remove('completed');
+            stepIndicator1.classList.add('active');
+            setLoading(loginBtn, false);
+        }
+
+        // 423: the authenticator is locked and waiting never lifts it. Final.
+        function lockVerification(message) {
+            if (waitTimer) { clearInterval(waitTimer); waitTimer = null; }
+            showError(message || 'This authenticator is locked. Contact support or recover your account with another verification method.');
+            verifyBtn.disabled = true;
+            verifyBtn.textContent = 'Locked';
+            document.getElementById('mfa-code').disabled = true;
+        }
+
+        // 429: honour Retry-After by holding the button until the wait is over.
+        function holdVerification(seconds) {
+            if (waitTimer) { clearInterval(waitTimer); }
+            let remaining = seconds;
+            const render = () => {
+                showError('Too many incorrect codes. Try again in ' + remaining + 's.');
+                verifyBtn.textContent = 'Wait ' + remaining + 's';
+            };
+            verifyBtn.disabled = true;
+            render();
+            waitTimer = setInterval(() => {
+                remaining -= 1;
+                if (remaining <= 0) {
+                    clearInterval(waitTimer);
+                    waitTimer = null;
+                    hideMessages();
+                    setLoading(verifyBtn, false);
+                    return;
+                }
+                render();
+            }, 1000);
+        }
+
         function setLoading(button, loading) {
             if (loading) {
                 button.disabled = true;
@@ -331,12 +383,15 @@
                 const data = await response.json();
 
                 if (!data.success) {
-                    showError(data.error || 'Login failed');
+                    const wait = parseInt(response.headers.get('Retry-After'), 10);
+                    showError((data.error || 'Login failed') +
+                        (response.status === 429 && wait > 0 ? ' Try again in ' + wait + 's.' : ''));
                     setLoading(loginBtn, false);
                     return;
                 }
 
                 // Store state for step 2
+                loginState.mfaChallengeToken = data.mfaChallengeToken || '';
                 loginState.userId = data.userId;
                 loginState.userType = data.userType;
                 loginState.companyId = data.companyId || '';
@@ -370,13 +425,30 @@
                         userType: loginState.userType,
                         code: code,
                         companyId: loginState.companyId,
-                        administrationCompanyId: loginState.administrationCompanyId
+                        administrationCompanyId: loginState.administrationCompanyId,
+                        mfaChallengeToken: loginState.mfaChallengeToken
                     })
                 });
 
                 const data = await response.json();
 
                 if (!data.success) {
+                    if (data.restartLogin) {
+                        // 401, challenge missing/expired: no code was checked.
+                        goToStep1();
+                        showError('Your sign-in step expired before the code was checked. Enter your email and phone number again.');
+                        return;
+                    }
+                    if (data.locked) {
+                        // 423: final.
+                        lockVerification(data.error);
+                        return;
+                    }
+                    if (data.retryAfterSeconds > 0) {
+                        // 429 (or a wrong code that tripped a lockout): wait.
+                        holdVerification(data.retryAfterSeconds);
+                        return;
+                    }
                     showError(data.error || 'Verification failed');
                     setLoading(verifyBtn, false);
                     return;
