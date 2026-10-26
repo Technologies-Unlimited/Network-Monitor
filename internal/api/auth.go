@@ -196,6 +196,10 @@ type VerifyMFAResponse struct {
 	UserName  string `json:"userName,omitempty"`
 	Message   string `json:"message,omitempty"`
 	Error     string `json:"error,omitempty"`
+	// Code is ThothOS's machine reason for a step-2 failure (#2701):
+	// mfa_challenge_required, mfa_code_invalid, mfa_locked, mfa_rate_limited.
+	// Empty from a ThothOS that predates it.
+	Code string `json:"code,omitempty"`
 	// RetryAfterSeconds is ThothOS's own field name (verify-mfa route.ts:432),
 	// also filled from the Retry-After header when only the header was sent.
 	RetryAfterSeconds int `json:"retryAfterSeconds,omitempty"`
@@ -523,12 +527,12 @@ func (s *AuthService) relayVerifyMFAFailure(c *gin.Context, limitKey string, res
 		}
 	}
 
-	switch {
-	case status == http.StatusUnauthorized && out.Error != thothosInvalidCodeMessage:
+	switch classifyVerifyMFAFailure(status, out) {
+	case mfaOutcomeRestart:
 		out.RestartLogin = true
-	case status == http.StatusLocked:
+	case mfaOutcomeLocked:
 		out.Locked = true
-	case status == http.StatusTooManyRequests:
+	case mfaOutcomeWait:
 		// Refused before any code was checked; nothing to count.
 	default:
 		// Treat any other non-success response from ThothOS as a
@@ -537,6 +541,67 @@ func (s *AuthService) relayVerifyMFAFailure(c *gin.Context, limitKey string, res
 	}
 
 	c.JSON(status, out)
+}
+
+// ThothOS's machine codes on step-2 failures (ThothOS #2701).
+const (
+	mfaCodeChallengeRequired = "mfa_challenge_required"
+	mfaCodeInvalid           = "mfa_code_invalid"
+	mfaCodeLocked            = "mfa_locked"
+	mfaCodeRateLimited       = "mfa_rate_limited"
+)
+
+type mfaOutcome int
+
+const (
+	// mfaOutcomeCount: a code may have been evaluated; charge the local limiter.
+	mfaOutcomeCount mfaOutcome = iota
+	// mfaOutcomeRestart: challenge missing/expired; no code evaluated.
+	mfaOutcomeRestart
+	// mfaOutcomeLocked: final lock; no code evaluated.
+	mfaOutcomeLocked
+	// mfaOutcomeWait: ladder refusal; no code evaluated.
+	mfaOutcomeWait
+)
+
+// classifyVerifyMFAFailure decides what a non-success step-2 response means.
+// The machine `code` decides when present. Only when it is empty (a ThothOS
+// that predates #2701) do the status and the message decide.
+//
+// It fails closed: restarting skips the local limiter, so ONLY an explicit
+// mfa_challenge_required (or, with no code, the legacy challenge message) may
+// restart. An unknown non-empty code on a 401 counts as a failure.
+func classifyVerifyMFAFailure(status int, out *VerifyMFAResponse) mfaOutcome {
+	switch out.Code {
+	case mfaCodeChallengeRequired:
+		return mfaOutcomeRestart
+	case mfaCodeInvalid:
+		return mfaOutcomeCount
+	case mfaCodeLocked:
+		return mfaOutcomeLocked
+	case mfaCodeRateLimited:
+		return mfaOutcomeWait
+	case "":
+		// Legacy fallback: status and message.
+		switch {
+		case status == http.StatusUnauthorized && out.Error != thothosInvalidCodeMessage:
+			return mfaOutcomeRestart
+		case status == http.StatusLocked:
+			return mfaOutcomeLocked
+		case status == http.StatusTooManyRequests:
+			return mfaOutcomeWait
+		}
+		return mfaOutcomeCount
+	}
+	// Unknown non-empty code: a 401 must count (never a free retry); the
+	// status alone still identifies the two refusals that evaluated no code.
+	switch status {
+	case http.StatusLocked:
+		return mfaOutcomeLocked
+	case http.StatusTooManyRequests:
+		return mfaOutcomeWait
+	}
+	return mfaOutcomeCount
 }
 
 // handleAuthStatus returns the current authentication status
