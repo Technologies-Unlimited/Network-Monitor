@@ -380,6 +380,84 @@ func TestLoginRateLimitForwardsRetryAfterHeader(t *testing.T) {
 	}
 }
 
+// ThothOS #2701 adds a machine `code` to every step-2 failure. When present it
+// decides the outcome; the status/message logic is only the fallback for a
+// ThothOS that sends none. Messages are chosen to DISAGREE with the code where
+// possible, proving the code wins.
+func TestVerifyMFAFailureDecidedByMachineCode(t *testing.T) {
+	cases := []struct {
+		name        string
+		status      int
+		headers     map[string]string
+		body        string
+		wantRestart bool
+		wantLocked  bool
+		wantCounted bool
+		wantRetry   float64
+	}{
+		{
+			name:        "mfa_challenge_required restarts, even with a wrong-code message",
+			status:      http.StatusUnauthorized,
+			body:        `{"success":false,"code":"mfa_challenge_required","error":"Invalid MFA code"}`,
+			wantRestart: true,
+		},
+		{
+			name:        "mfa_code_invalid counts and does not restart, even with an expired-style message",
+			status:      http.StatusUnauthorized,
+			body:        `{"success":false,"code":"mfa_code_invalid","error":"` + stubChallengeExpiredMsg + `"}`,
+			wantCounted: true,
+		},
+		{
+			name:       "mfa_locked is final",
+			status:     http.StatusLocked,
+			body:       `{"success":false,"code":"mfa_locked","error":"` + stubLockedMsg + `"}`,
+			wantLocked: true,
+		},
+		{
+			name:      "mfa_rate_limited relays the wait",
+			status:    http.StatusTooManyRequests,
+			headers:   map[string]string{"Retry-After": "37"},
+			body:      `{"success":false,"code":"mfa_rate_limited","error":"` + stubWaitMsg + `","retryAfterSeconds":37}`,
+			wantRetry: 37,
+		},
+		{
+			// Fail closed: restarting skips the local limiter, so an unknown
+			// 401 must never become a free retry.
+			name:        "unknown code on a 401 counts and does not restart",
+			status:      http.StatusUnauthorized,
+			body:        `{"success":false,"code":"mfa_something_new","error":"` + stubChallengeExpiredMsg + `"}`,
+			wantCounted: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newAuthTestRig(t)
+			a.stub.on("/api/auth/proxy/verify-mfa", tc.status, tc.headers, tc.body)
+
+			w := a.post(t, "/api/v1/auth/verify-mfa", a.verifyPayload("tok-abc123"))
+
+			if w.Code != tc.status {
+				t.Fatalf("status = %d, want %d (%s)", w.Code, tc.status, w.Body.String())
+			}
+			got := decode(t, w)
+			if (got["restartLogin"] == true) != tc.wantRestart {
+				t.Errorf("restartLogin = %v, want %v (%s)", got["restartLogin"], tc.wantRestart, w.Body.String())
+			}
+			if (got["locked"] == true) != tc.wantLocked {
+				t.Errorf("locked = %v, want %v (%s)", got["locked"], tc.wantLocked, w.Body.String())
+			}
+			if tc.wantRetry != 0 && got["retryAfterSeconds"] != tc.wantRetry {
+				t.Errorf("retryAfterSeconds = %v, want %v", got["retryAfterSeconds"], tc.wantRetry)
+			}
+			a.svc.mfaLimits.mu.Lock()
+			defer a.svc.mfaLimits.mu.Unlock()
+			if counted := len(a.svc.mfaLimits.entries) == 1; counted != tc.wantCounted {
+				t.Errorf("local limiter counted = %v, want %v", counted, tc.wantCounted)
+			}
+		})
+	}
+}
+
 // The browser half cannot be exercised without a JS engine, so pin the
 // contract text the login page must contain: it stores the token from step 1,
 // sends it in step 2, and reacts to the three terminal outcomes.
