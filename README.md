@@ -129,13 +129,13 @@ Network Monitor includes a comprehensive OID template library based on Zabbix's 
 
 ## Prerequisites
 
-- **Go 1.21+** - [Install Go](https://go.dev/doc/install)
+- **Go 1.26+** - [Install Go](https://go.dev/doc/install)
 
 ## Quick Start
 
 ### Step I: Install Go Runtime
 
-Download and install Go 1.21+ from [https://go.dev/dl/](https://go.dev/dl/)
+Download and install Go 1.26+ from [https://go.dev/dl/](https://go.dev/dl/)
 
 ### Step II: Download Network Monitor
 
